@@ -1,0 +1,190 @@
+import os
+import json
+import requests
+import base64
+import time
+from pathlib import Path
+
+# 設定檔案路徑
+CONFIG_FILE = "/etc/cloudflare_nas/config.json"
+CREDENTIALS_FILE = "/etc/cloudflare_nas/credentials.json"
+CLOUDFLARED_CONFIG = "/etc/cloudflare/config.yml"
+CLOUDFLARED_BIN = "/usr/local/bin/cloudflared"
+
+class CloudflareNAS:
+    def __init__(self):
+        self.load_config()
+        self.headers = {
+            "Authorization": f"Bearer {self.config['api_token']}",
+            "Content-Type": "application/json"
+        }
+
+    def load_config(self):
+        """載入設定檔"""
+        with open(CONFIG_FILE, "r") as f:
+            self.config = json.load(f)
+
+    def get_public_ip(self):
+        """獲取當前公網 IP"""
+        try:
+            return requests.get('https://api.ipify.org').text
+        except Exception as e:
+            print(f"獲取 IP 失敗: {e}")
+            return None
+
+    def update_dns_record(self, ip):
+        """更新或創建 DNS A 紀錄"""
+        url = f"https://api.cloudflare.com/client/v4/zones/{self.config['zone_id']}/dns_records"
+        params = {
+            "type": "A",
+            "name": self.config["dns_record"]
+        }
+
+        # 檢查現有紀錄
+        response = requests.get(url, headers=self.headers, params=params)
+        records = response.json()["result"]
+
+        data = {
+            "type": "A",
+            "name": self.config["dns_record"],
+            "content": ip,
+            "ttl": 1,
+            "proxied": False
+        }
+
+        if records:
+            # 更新現有紀錄
+            record_id = records[0]["id"]
+            response = requests.put(f"{url}/{record_id}", headers=self.headers, json=data)
+        else:
+            # 創建新紀錄
+            response = requests.post(url, headers=self.headers, json=data)
+
+        return response.json()
+
+    def create_tunnel(self):
+        """透過 API 創建 Cloudflare Tunnel"""
+        url = f"https://api.cloudflare.com/client/v4/accounts/{self.config['account_id']}/tunnels"
+        
+        # 生成隨機 Tunnel Secret
+        tunnel_secret = base64.b64encode(os.urandom(32)).decode('utf-8')
+        
+        data = {
+            "name": self.config["tunnel_name"],
+            "tunnel_secret": tunnel_secret
+        }
+        
+        response = requests.post(url, headers=self.headers, json=data)
+        result = response.json()
+        
+        if response.status_code == 200:
+            self.tunnel_id = result["result"]["id"]
+            self.tunnel_secret = tunnel_secret
+            return True
+        else:
+            print(f"創建 Tunnel 失敗: {result}")
+            return False
+
+    def configure_tunnel_route(self):
+        """配置 Tunnel 路由到域名"""
+        url = f"https://api.cloudflare.com/client/v4/accounts/{self.config['account_id']}/tunnels/{self.tunnel_id}/routes"
+        data = {
+            "type": "dns",
+            "hostname": self.config["dns_record"],
+            "service": self.config["nas_service_url"]
+        }
+        response = requests.post(url, headers=self.headers, json=data)
+        return response.json()
+
+    def save_tunnel_credentials(self):
+        """保存 Tunnel 憑證文件"""
+        credentials = {
+            "AccountTag": self.config["account_id"],
+            "TunnelID": self.tunnel_id,
+            "TunnelSecret": self.tunnel_secret
+        }
+        with open(CREDENTIALS_FILE, "w") as f:
+            json.dump(credentials, f)
+        os.chmod(CREDENTIALS_FILE, 0o600)
+
+    def generate_cloudflared_config(self):
+        """生成 cloudflared 配置文件"""
+        config = {
+            "tunnel": self.tunnel_id,
+            "credentials-file": CREDENTIALS_FILE,
+            "ingress": [
+                {"hostname": self.config["dns_record"], "service": self.config["nas_service_url"]},
+                {"service": "http_status:404"}
+            ]
+        }
+        with open(CLOUDFLARED_CONFIG, "w") as f:
+            json.dump(config, f, indent=2)
+
+    def install_cloudflared(self):
+        """下載並安裝 cloudflared"""
+        if not Path(CLOUDFLARED_BIN).exists():
+            os.system("wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /tmp/cloudflared")
+            os.system("chmod +x /tmp/cloudflared")
+            os.system("sudo mv /tmp/cloudflared /usr/local/bin/cloudflared")
+
+    def setup_service(self):
+        """設置 systemd 服務"""
+        service_content = f"""
+        [Unit]
+        Description=Cloudflare Tunnel
+        After=network.target
+
+        [Service]
+        ExecStart={CLOUDFLARED_BIN} tunnel run --config {CLOUDFLARED_CONFIG}
+        Restart=always
+
+        [Install]
+        WantedBy=multi-user.target
+        """
+        with open("/etc/systemd/system/cloudflared.service", "w") as f:
+            f.write(service_content)
+        
+        os.system("sudo systemctl daemon-reload")
+        os.system("sudo systemctl enable cloudflared")
+        os.system("sudo systemctl start cloudflared")
+
+    def run(self):
+        """主執行流程"""
+        # 步驟 1: 更新 DDNS
+        current_ip = self.get_public_ip()
+        if current_ip:
+            print(f"當前公網 IP: {current_ip}")
+            dns_result = self.update_dns_record(current_ip)
+            print(f"DNS 更新結果: {dns_result['success']}")
+
+        # 步驟 2: 創建 Tunnel
+        if self.create_tunnel():
+            print(f"Tunnel 創建成功: {self.tunnel_id}")
+            self.configure_tunnel_route()
+            self.save_tunnel_credentials()
+            self.generate_cloudflared_config()
+
+            # 步驟 3: 安裝並啟動服務
+            self.install_cloudflared()
+            self.setup_service()
+            print("Cloudflare Tunnel 服務已啟動")
+
+if __name__ == "__main__":
+    # 初次運行前需手動創建設定檔案
+    config_path = Path(CONFIG_FILE)
+    if not config_path.exists():
+        config = {
+            "api_token": "YOUR_API_TOKEN",
+            "zone_id": "YOUR_ZONE_ID",
+            "account_id": "YOUR_ACCOUNT_ID",
+            "dns_record": "nas.yourdomain.com",
+            "tunnel_name": "feynax_nas_tunnel",
+            "nas_service_url": "http://localhost:8080"  # 修改為 NAS 實際服務地址
+        }
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f, indent=2)
+        print(f"請先編輯設定檔: {CONFIG_FILE}")
+    else:
+        nas = CloudflareNAS()
+        nas.run()
